@@ -163,3 +163,6 @@
 #   files/mtp_patched.py,
 #   files/ple_offload/*.py    generated from the .orig copies on every launch
 #   files/block_drop/         orig/ from the image, patched copies generated per launch
+!/files/patch_qwen_tool_parser.sh
+!/files/patches/
+!/files/patches/*.patch

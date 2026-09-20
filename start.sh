@@ -659,6 +659,10 @@ MODELOPT_PKG="$VLLM_PKG/model_executor/layers/quantization/modelopt.py"
 QSA_OPS_PKG="$VLLM_PKG/models/qwen3_8_flash_next/nvidia/ops/qsa.py"
 QSA_NVIDIA_PKG="$VLLM_PKG/models/qwen3_8_flash_next/nvidia/qsa.py"
 MTP_PKG="$VLLM_PKG/models/qwen3_8_flash_next/nvidia/mtp.py"
+PARSER_PKGS=("$VLLM_PKG/parser/qwen3.py"
+             "$VLLM_PKG/parser/nemotron_v3.py"
+             "$VLLM_PKG/parser/engine/parser_engine_config.py"
+             "$VLLM_PKG/parser/engine/streaming_parser_engine.py")
 
 info "=== Step 4: Prepare patches ==="
 if ! docker image inspect "$IMAGE" &>/dev/null; then
@@ -712,6 +716,16 @@ PATCHED_MODELOPT="$SCRIPT_DIR/files/modelopt_patched.py"
 extract "$MODELOPT_PKG" "$SCRIPT_DIR/files/modelopt_patched.py.orig"
 python3 "$SCRIPT_DIR/files/patch_modelopt_mxfp8.py"
 [[ -f "$PATCHED_MODELOPT" ]] || err "modelopt patch missing after patch_modelopt_mxfp8.py"
+
+# Qwen tool-marker truncation. The parser enters a tool preamble as soon as it
+# sees the opener, so an answer that merely quotes `<tool_call>` -- reviewing
+# agent code, explaining the format, a fenced example -- loses that text and
+# everything after it, silently, with finish_reason "stop". Measured here: a
+# 150-character answer came back as "La etiqueta ". Real tool calls, multiple
+# calls and ordinary text parse byte-identically before and after.
+PARSER_DIR="$SCRIPT_DIR/files/parser/vllm"
+"$SCRIPT_DIR/files/patch_qwen_tool_parser.sh" >/dev/null
+[[ -f "$PARSER_DIR/parser/qwen3.py" ]] || err "parser patch missing after patch_qwen_tool_parser.sh"
 
 # FP8 KV support for the QSA kernels. The patch is compiled out when the KV
 # cache is BF16, so it is applied unconditionally and costs nothing at KV_CACHE_DTYPE=auto.
@@ -1235,6 +1249,10 @@ docker run \\
     $OVERLAY_MOUNTS \\
     $BLOCK_DROP_MOUNTS \\
     $OFFLOAD_MOUNTS \\
+    -v $PARSER_DIR/parser/qwen3.py:${PARSER_PKGS[0]}:ro \\
+    -v $PARSER_DIR/parser/nemotron_v3.py:${PARSER_PKGS[1]}:ro \\
+    -v $PARSER_DIR/parser/engine/parser_engine_config.py:${PARSER_PKGS[2]}:ro \\
+    -v $PARSER_DIR/parser/engine/streaming_parser_engine.py:${PARSER_PKGS[3]}:ro \\
     -v $HF_CACHE_DIR:/root/.cache/huggingface \\
     -v $HOME/.cache/vllm:/root/.cache/vllm \\
     $GDN_PREFILL_MOUNTS \\
