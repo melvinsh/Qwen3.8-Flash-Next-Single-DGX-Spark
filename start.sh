@@ -727,6 +727,22 @@ PARSER_DIR="$SCRIPT_DIR/files/parser/vllm"
 "$SCRIPT_DIR/files/patch_qwen_tool_parser.sh" >/dev/null
 [[ -f "$PARSER_DIR/parser/qwen3.py" ]] || err "parser patch missing after patch_qwen_tool_parser.sh"
 
+# reasoning_effort aliases. The checkpoint's template takes xhigh/medium/low and
+# raises on anything else, so a client sending the OpenAI-standard "high" gets a
+# 400. The rewrite maps high/max -> xhigh and minimal -> low and changes nothing
+# else: with the key absent, which is every current client here, the template
+# renders byte-identically. The script no-ops loudly if the template is not the
+# one it expects, so an unexpected checkpoint serves stock rather than something
+# nobody checked.
+EFFORT_TEMPLATE="$SCRIPT_DIR/files/chat_template_effort.jinja"
+"$SCRIPT_DIR/files/patch_chat_template_effort.sh" "$MODEL_PATH/$SNAPSHOT_REL" >/dev/null
+# Empty when the script declined to rewrite, so neither the flag nor the mount
+# is added. Guarding on the variable alone would mount a path that is not there
+# and docker would helpfully create a directory at it.
+# An explicit CHAT_TEMPLATE (below) replaces the template outright, so the effort rewrite of the stock one
+# does not apply to it; two --chat-template flags would conflict.
+[[ -f "$EFFORT_TEMPLATE" && -z "${CHAT_TEMPLATE:-}" ]] || EFFORT_TEMPLATE=""
+
 # FP8 KV support for the QSA kernels. The patch is compiled out when the KV
 # cache is BF16, so it is applied unconditionally and costs nothing at KV_CACHE_DTYPE=auto.
 PATCHED_QSA_OPS="$SCRIPT_DIR/files/qsa_ops_patched.py"
@@ -982,6 +998,7 @@ if [[ "$GDN_PREFILL_BACKEND" != auto ]]; then
     VLLM_ARGS+=("--additional-config" "'{\"gdn_prefill_backend\":\"$GDN_PREFILL_BACKEND\"}'")
 fi
 VLLM_ARGS+=("--reasoning-parser" "qwen3")
+[[ -n "$EFFORT_TEMPLATE" ]] && VLLM_ARGS+=("--chat-template" "/root/chat_template_effort.jinja")
 VLLM_ARGS+=("--enable-auto-tool-choice")
 # CHAT_TEMPLATE: host path to a replacement Jinja chat template, mounted into
 # the container read-only. The shipped froggeric v22.5 template
@@ -1253,6 +1270,7 @@ docker run \\
     -v $PARSER_DIR/parser/nemotron_v3.py:${PARSER_PKGS[1]}:ro \\
     -v $PARSER_DIR/parser/engine/parser_engine_config.py:${PARSER_PKGS[2]}:ro \\
     -v $PARSER_DIR/parser/engine/streaming_parser_engine.py:${PARSER_PKGS[3]}:ro \\
+    ${EFFORT_TEMPLATE:+-v $EFFORT_TEMPLATE:/root/chat_template_effort.jinja:ro} \\
     -v $HF_CACHE_DIR:/root/.cache/huggingface \\
     -v $HOME/.cache/vllm:/root/.cache/vllm \\
     $GDN_PREFILL_MOUNTS \\
