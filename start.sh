@@ -111,10 +111,10 @@ _CLI_READY_TIMEOUT_S="${READY_TIMEOUT_S:-}"
 _ENV_SNAPSHOT_VARS=(KV_TARGET_GIB HOST_RESERVE_GIB HOST_SLACK_GIB OS_RESERVE_GIB
                     MEMWATCH_MIN_GIB MEMWATCH_MIN_FREE_GIB MEMWATCH_FREE_GATE_GIB MEMWATCH_GRACE
                     OVERHEAD_GIB PLE_GIB CONTAINER_MEM_GIB KV_CACHE_MEMORY
-                    MAMBA_SSM_CACHE_DTYPE
+                    MAMBA_SSM_CACHE_DTYPE GDN_PREFILL_BACKEND
                     IMAGE SERVED_MODEL_NAME CUDAGRAPH_MODE HF_TOKEN
                     CUDAGRAPH_CAPTURE_SIZES COMPILATION_MODE MTP_K_SCHEDULE
-                    MTP_DRAFT_VOCAB
+                    MTP_DRAFT_VOCAB MTP_DRAFT_HEAD_FP8
                     EXTRA_VLLM_ARGS EXTRA_DOCKER_ARGS NATIVE_MAX_MODEL_LEN
                     YARN_CEILING_MODEL_LEN BIND READY_TIMEOUT_S API_KEY
                     VLLM_QSA_DET_TOPK VLLM_MOE_DET_FINALIZE GDN_DECODE_KERNEL
@@ -206,6 +206,13 @@ KV_CACHE_MEMORY="${KV_CACHE_MEMORY:-}"          # optional hard pin, bytes
 # costs to read and write every step, and halves the mamba page, which lets
 # vLLM pick a smaller attention block. Empty keeps the checkpoint's float32.
 MAMBA_SSM_CACHE_DTYPE="${MAMBA_SSM_CACHE_DTYPE:-}"
+# Preserve stock auto selection by default. FlashInfer on SM121 is opt-in and
+# source-checked against the tested image; it changes prefill only, not decode.
+GDN_PREFILL_BACKEND="${GDN_PREFILL_BACKEND:-auto}"
+case "$GDN_PREFILL_BACKEND" in
+    auto|triton|flashinfer) ;;
+    *) err "GDN_PREFILL_BACKEND must be auto, triton, or flashinfer" ;;
+esac
 # Runtime overhead on top of weights, GiB (measured at TP1: 3.37+1.92+0.12).
 OVERHEAD_GIB="${OVERHEAD_GIB:-5.6}"
 # KV the derived budget targets when GMU is not pinned. More KV = more UVM.
@@ -291,6 +298,15 @@ if [[ "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 && -z "$MTP_DRAFT_VOCAB" ]]; then
     warn "  MTP on with the full 248k draft head: reduced-vocabulary drafting is off."
     warn "  Set MTP_DRAFT_VOCAB (shipped default: files/draft_vocab_en_code_47k.txt)"
     warn "  for ~17% faster single-stream decode at unchanged accuracy (see CHANGELOG 2026-09-05)."
+fi
+# Optional W8A16 copy of the reduced draft head only. Full target weights and
+# acceptance are untouched. Original BF16 buffers remain for large-M fallback.
+MTP_DRAFT_HEAD_FP8="${MTP_DRAFT_HEAD_FP8:-0}"
+[[ "$MTP_DRAFT_HEAD_FP8" == 0 || "$MTP_DRAFT_HEAD_FP8" == 1 ]] \
+    || err "MTP_DRAFT_HEAD_FP8 must be 0 or 1"
+if [[ "$MTP_DRAFT_HEAD_FP8" == 1 ]]; then
+    [[ "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 && -n "$MTP_DRAFT_VOCAB" ]] \
+        || err "MTP_DRAFT_HEAD_FP8 requires MTP and MTP_DRAFT_VOCAB"
 fi
 # torch.compile level: 0 = none (shipped default), 3 = VLLM_COMPILE (Inductor
 # fusion; adds minutes to the first launch and has not been validated against
@@ -747,6 +763,15 @@ if [[ "$MTP_DISABLE_BLOCK_DROP" == 1 && "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 ]]; 
         fi
     done
 fi
+MTP_FP8_MOUNTS=""
+if [[ "$MTP_DRAFT_HEAD_FP8" == 1 ]]; then
+    MTP_FP8_DIR="$SCRIPT_DIR/files/mtp_fp8_generated"
+    mkdir -p "$MTP_FP8_DIR"
+    python3 "$SCRIPT_DIR/files/patch_mtp_fp8_head.py" \
+        --source "$PATCHED_MTP" --output "$MTP_FP8_DIR/mtp.py"
+    PATCHED_MTP="$MTP_FP8_DIR/mtp.py"
+    MTP_FP8_MOUNTS="-v $SCRIPT_DIR/files/spark_mtp_fp8_head.py:$VLLM_PKG/models/qwen3_8_flash_next/nvidia/spark_mtp_fp8_head.py:ro -e VLLM_MTP_DRAFT_HEAD_FP8=1"
+fi
 
 OFFLOAD_DIR="$SCRIPT_DIR/files/ple_offload"
 mkdir -p "$OFFLOAD_DIR/orig"
@@ -891,6 +916,19 @@ fi
 PLE_ORG="${PLE_CACHE_ID%%/*}"; PLE_NAME="${PLE_CACHE_ID##*/}"
 PLE_CACHE_HOST="$HOME/.cache/vllm/ple_cache/${PLE_ORG}--${PLE_NAME}"
 PLE_CACHE_CTR="/root/.cache/vllm/ple_cache/${PLE_ORG}--${PLE_NAME}"
+
+GDN_PREFILL_MOUNTS=""
+if [[ "$GDN_PREFILL_BACKEND" == flashinfer ]]; then
+    GDN_PREFILL_DIR="$SCRIPT_DIR/files/gdn_sm121_generated"
+    mkdir -p "$GDN_PREFILL_DIR"
+    docker run --rm --network none --memory 512m \
+        -v "$SCRIPT_DIR/files/patch_gdn_sm121.py:/patch_gdn_sm121.py:ro" \
+        -v "$GDN_PREFILL_DIR:/out" \
+        --entrypoint python3 "$IMAGE" /patch_gdn_sm121.py \
+        --output /out/qwen_gdn_linear_attn.py
+    GDN_PREFILL_MOUNTS="-v $GDN_PREFILL_DIR/qwen_gdn_linear_attn.py:$VLLM_PKG/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py:ro"
+fi
+
 if ! ls "$PLE_CACHE_HOST"/*.packed_u8 >/dev/null 2>&1; then
     info "Building packed PLE table (one-time, ~40 s, <1 GiB RAM, no GPU)..."
     mkdir -p "$PLE_CACHE_HOST"
@@ -924,6 +962,11 @@ fi
 VLLM_ARGS+=("--load-format" "safetensors")
 VLLM_ARGS+=("--safetensors-load-strategy" "lazy")
 VLLM_ARGS+=("--enable-chunked-prefill")
+if [[ "$GDN_PREFILL_BACKEND" != auto ]]; then
+    [[ "$EXTRA_VLLM_ARGS" != *--additional-config* ]] \
+        || err "GDN_PREFILL_BACKEND owns --additional-config; remove it from EXTRA_VLLM_ARGS."
+    VLLM_ARGS+=("--additional-config" "'{\"gdn_prefill_backend\":\"$GDN_PREFILL_BACKEND\"}'")
+fi
 VLLM_ARGS+=("--reasoning-parser" "qwen3")
 VLLM_ARGS+=("--enable-auto-tool-choice")
 # CHAT_TEMPLATE: host path to a replacement Jinja chat template, mounted into
@@ -1129,8 +1172,10 @@ fi
 info "  GMU:        $GPU_MEMORY_UTILIZATION  (budget ${BUDGET_GIB} GiB, cgroup cap ${CONTAINER_MEM_GIB} GiB)"
 info "  Max seqs:   $MAX_NUM_SEQS   Batched tokens: $MAX_NUM_BATCHED_TOKENS   KV dtype: $KV_CACHE_DTYPE"
 info "  SSM state:  ${MAMBA_SSM_CACHE_DTYPE:-float32 (checkpoint)}"
+info "  GDN prefill: $GDN_PREFILL_BACKEND"
 info "  MTP:        $MTP_NUM_SPECULATIVE_TOKENS $( [[ "$MTP_NUM_SPECULATIVE_TOKENS" -eq 0 ]] && echo '(disabled)')"
 info "  Draft vocab: ${MTP_DRAFT_VOCAB:-full (248320)}   Disable block drop: $MTP_DISABLE_BLOCK_DROP"
+info "  Draft-head FP8: $MTP_DRAFT_HEAD_FP8 (target head unchanged)"
 info "  Graphs:     $CUDAGRAPH_MODE  capture=${_CG_SIZES:-vllm-default}  compile-mode=$COMPILATION_MODE"
 info "  Port:       $PORT  (bind $BIND)"
 info ""
@@ -1192,6 +1237,8 @@ docker run \\
     $OFFLOAD_MOUNTS \\
     -v $HF_CACHE_DIR:/root/.cache/huggingface \\
     -v $HOME/.cache/vllm:/root/.cache/vllm \\
+    $GDN_PREFILL_MOUNTS \\
+    $MTP_FP8_MOUNTS \\
     $EXTRA_DOCKER_ARGS \\
     $IMAGE \\
     $MODEL_ID \\
